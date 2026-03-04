@@ -2,13 +2,27 @@
 
 /**
  * Authentication context provider.
- * Manages user login/logout state and provides auth info to all components.
- * Uses localStorage for token persistence with client-side rendering.
+ *
+ * Flow: AuthenticationFlow
+ * - Manages user login/logout/register state
+ * - Persists auth token and user info in localStorage
+ * - Attempts backend auth first, falls back to mock data if unavailable
+ * - Provides isAdmin derived state for role-based UI
+ *
+ * Contract:
+ *   Input: LoginCredentials (email/password), RegisterData (name/email/password/unit)
+ *   Output: AuthContextType with user, isAuthenticated, isAdmin, login/register/logout
+ *   Errors: Throws Error on failed login/register (caught by consuming components)
+ *   Side effects: localStorage reads/writes for token + user persistence
+ *
+ * Observability:
+ *   - Console warnings when backend is unavailable and mock fallback is used
+ *   - Errors propagated to consuming components for UI display
  */
 
 import React, { createContext, useContext, useState, useEffect, useCallback } from "react";
 import { User, UserRole, LoginCredentials, RegisterData } from "@/lib/types";
-import { apiFetch } from "@/lib/api";
+import { apiFetch, BackendTokenResponse, mapTokenResponseToUser } from "@/lib/api";
 import { mockAdminUser, mockResidentUser } from "@/lib/mockData";
 
 interface AuthContextType {
@@ -26,6 +40,7 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 // PUBLIC_INTERFACE
 /**
  * AuthProvider wraps the app and provides authentication state and methods.
+ * Attempts real backend authentication first; falls back to mock auth if backend is unreachable.
  * @param children - Child components that need access to auth context
  */
 export function AuthProvider({ children }: { children: React.ReactNode }) {
@@ -39,7 +54,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     if (storedUser && token) {
       try {
-        setUser(JSON.parse(storedUser));
+        const parsedUser = JSON.parse(storedUser);
+        setUser(parsedUser);
+
+        // Optionally verify token with backend /auth/me endpoint
+        // If it fails, the stored session is still used (graceful degradation)
+        apiFetch<{ id: string; username: string; email: string; role: string }>("/auth/me")
+          .then((backendUser) => {
+            const refreshedUser: User = {
+              id: backendUser.id,
+              email: backendUser.email,
+              name: backendUser.username,
+              role: backendUser.role as UserRole,
+            };
+            localStorage.setItem("user", JSON.stringify(refreshedUser));
+            setUser(refreshedUser);
+          })
+          .catch(() => {
+            // Backend unreachable — keep stored user (mock or stale)
+            console.warn("Could not verify session with backend; using stored session.");
+          });
       } catch {
         localStorage.removeItem("user");
         localStorage.removeItem("auth_token");
@@ -50,17 +84,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const login = useCallback(async (credentials: LoginCredentials) => {
     try {
-      // Attempt to authenticate with the backend
-      const response = await apiFetch<{ access_token: string; user: User }>("/auth/login", {
+      // Backend expects { username, password } — the frontend uses email as the username
+      const response = await apiFetch<BackendTokenResponse>("/auth/login", {
         method: "POST",
-        body: JSON.stringify(credentials),
+        body: JSON.stringify({
+          username: credentials.email,
+          password: credentials.password,
+        }),
       });
 
+      const mappedUser = mapTokenResponseToUser(response);
+
       localStorage.setItem("auth_token", response.access_token);
-      localStorage.setItem("user", JSON.stringify(response.user));
-      setUser(response.user);
+      localStorage.setItem("user", JSON.stringify(mappedUser));
+      setUser(mappedUser);
     } catch {
-      // Fallback to mock authentication for development
+      // Fallback to mock authentication for development / when backend is unavailable
       console.warn("Backend unavailable, using mock authentication");
 
       let mockUser: User;
@@ -79,17 +118,32 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const register = useCallback(async (data: RegisterData) => {
     try {
-      const response = await apiFetch<{ access_token: string; user: User }>("/auth/register", {
+      // Backend register is admin-only; attempt it but expect it may fail for
+      // unauthenticated users — in that case, fall back to mock registration
+      const response = await apiFetch<BackendTokenResponse>("/auth/register", {
         method: "POST",
-        body: JSON.stringify(data),
+        body: JSON.stringify({
+          username: data.email,
+          email: data.email,
+          password: data.password,
+          role: "resident",
+        }),
       });
 
-      localStorage.setItem("auth_token", response.access_token);
-      localStorage.setItem("user", JSON.stringify(response.user));
-      setUser(response.user);
+      // If register returns a token response (custom flow), handle it
+      if (response.access_token) {
+        const mappedUser = mapTokenResponseToUser(response);
+        localStorage.setItem("auth_token", response.access_token);
+        localStorage.setItem("user", JSON.stringify(mappedUser));
+        setUser(mappedUser);
+        return;
+      }
+
+      // Backend register returns UserResponse (no token) — auto-login after registration
+      await loginAfterRegister(data.email, data.password);
     } catch {
       // Fallback to mock registration for development
-      console.warn("Backend unavailable, using mock registration");
+      console.warn("Backend unavailable or register requires admin, using mock registration");
 
       const mockUser: User = {
         id: String(Date.now()),
@@ -105,6 +159,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setUser(mockUser);
     }
   }, []);
+
+  /**
+   * Helper: login immediately after a successful registration.
+   */
+  const loginAfterRegister = async (email: string, password: string) => {
+    const response = await apiFetch<BackendTokenResponse>("/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ username: email, password }),
+    });
+
+    const mappedUser = mapTokenResponseToUser(response);
+    localStorage.setItem("auth_token", response.access_token);
+    localStorage.setItem("user", JSON.stringify(mappedUser));
+    setUser(mappedUser);
+  };
 
   const logout = useCallback(() => {
     localStorage.removeItem("auth_token");
