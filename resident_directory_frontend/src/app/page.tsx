@@ -1,9 +1,23 @@
+"use client";
+
+/**
+ * Main entry page for the Resident Directory Management System.
+ * Renders the AppShell wrapped with the AuthProvider for auth state management.
+ * This is a client component since the app uses static export (output: "export").
+ */
+
+import { AuthProvider } from "@/context/AuthContext";
+import AppShell from "@/components/AppShell";
+
+// PUBLIC_INTERFACE
+/**
+ * Home page component - entry point for the application.
+ * Wraps the app shell with authentication context provider.
+ */
 export default function Home() {
   return (
-    <main className="min-h-screen bg-white flex items-center justify-center">
-      <h1 className="text-black text-4xl font-light">
-        resident_directory_frontend is being generated
-      </h1>
-    </main>
+    <AuthProvider>
+      <AppShell />
+    </AuthProvider>
   );
 }
